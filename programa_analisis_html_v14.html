@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analizador CSV</title>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background:#f5f7fa; color:#1f2937; }
+    .card { background:#fff; border-radius:12px; padding:20px; max-width:1200px; margin:0 auto; box-shadow:0 4px 18px rgba(0,0,0,.08); }
+    h1 { margin-top:0; }
+    .selector-grid { display:grid; grid-template-columns:240px 1fr; gap:10px 14px; align-items:center; margin:16px 0; padding:14px; background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px; }
+    .fila-botones { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    .ruta { background:#fff; border:1px solid #d1d5db; border-radius:8px; padding:10px 12px; min-height:20px; flex:1; word-break:break-word; }
+    button { background:#2563eb; color:#fff; border:none; border-radius:8px; padding:10px 16px; cursor:pointer; }
+    button:hover { background:#1d4ed8; }
+    .secondary { background:#4b5563; }
+    .secondary:hover { background:#374151; }
+    button:disabled { background:#9ca3af; cursor:not-allowed; }
+    .box { background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px; padding:14px; margin-top:14px; white-space:pre-wrap; }
+    .ok { color:#065f46; }
+    .warn { color:#92400e; }
+    .err { color:#991b1b; }
+    table { width:100%; border-collapse:collapse; margin-top:14px; font-size:14px; }
+    th, td { border:1px solid #d1d5db; padding:8px; text-align:left; }
+    th { background:#eff6ff; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>Conversión de RESULTADOS_*.csv a Excel</h1>
+  <p>Selecciona las 3 carpetas y pulsa <strong>Procesar archivos</strong>.</p>
+
+  <div class="selector-grid">
+    <div><strong>Carpeta CSV</strong></div>
+    <div class="fila-botones">
+      <button id="btnOrigen">Seleccionar carpeta CSV</button>
+      <div id="rutaOrigen" class="ruta">No seleccionada</div>
+    </div>
+
+    <div><strong>Carpeta destino Excel</strong></div>
+    <div class="fila-botones">
+      <button id="btnDestino">Seleccionar carpeta Excel</button>
+      <div id="rutaDestino" class="ruta">No seleccionada</div>
+    </div>
+
+    <div><strong>Carpeta CSV no válidos</strong></div>
+    <div class="fila-botones">
+      <button id="btnNoValidos">Seleccionar carpeta no válidos</button>
+      <div id="rutaNoValidos" class="ruta">No seleccionada</div>
+    </div>
+  </div>
+
+  <div class="fila-botones">
+    <button id="btnProcesar">Procesar archivos</button>
+    <button id="btnAuto" class="secondary">Activar vigilancia automática</button>
+    <span id="estadoAuto" style="font-size:14px;color:#4b5563;">Vigilancia desactivada</span>
+  </div>
+
+  <div id="estado" class="box">Esperando selección de carpetas.</div>
+
+  <h2>Vista previa FV0162</h2>
+  <div id="tablaFV"></div>
+
+  <h2>Vista previa CUARZO</h2>
+  <div id="tablaCuarzo"></div>
+</div>
+
+<script>
+const columnasFV = ['Fecha','Sample Identity','% SiO2','% Al2O3','% Fe2O3','% CaO','% Na2O','% K2O','% TiO2','% PPC','Method'];
+const columnasCuarzo = ['Fecha','Sample Identity','% Al2O3','% CaO','% Fe2O3','% K2O','% Na2O','% SiO2','% TiO2','% PPC','Method'];
+
+const estado = document.getElementById('estado');
+const tablaFV = document.getElementById('tablaFV');
+const tablaCuarzo = document.getElementById('tablaCuarzo');
+const rutaOrigen = document.getElementById('rutaOrigen');
+const rutaDestino = document.getElementById('rutaDestino');
+const rutaNoValidos = document.getElementById('rutaNoValidos');
+
+let carpetaOrigenHandle = null;
+let carpetaDestinoHandle = null;
+let carpetaNoValidosHandle = null;
+let autoMonitorActivo = false;
+let autoMonitorTimer = null;
+let procesandoAhora = false;
+const btnAuto = document.getElementById('btnAuto');
+const estadoAuto = document.getElementById('estadoAuto');
+
+function ponerEstado(texto, clase='') {
+  estado.className = 'box ' + clase;
+  estado.textContent = texto;
+}
+function escapeHtml(t) {
+  return String(t ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function renderTabla(destino, registros, columnas) {
+  if (!registros.length) {
+    destino.innerHTML = '<div class="box">Sin registros.</div>';
+    return;
+  }
+  let html = '<table><thead><tr>';
+  for (const c of columnas) html += '<th>' + escapeHtml(c) + '</th>';
+  html += '</tr></thead><tbody>';
+  for (const r of registros) {
+    html += '<tr>';
+    for (const c of columnas) html += '<td>' + escapeHtml(r[c]) + '</td>';
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  destino.innerHTML = html;
+}
+async function asegurarPermisoDirectorio(handle) {
+  const opts = { mode: 'readwrite' };
+  let p = await handle.queryPermission(opts);
+  if (p === 'granted') return true;
+  p = await handle.requestPermission(opts);
+  return p === 'granted';
+}
+function extraerFechaHora(linea) {
+  const m = linea.match(/^(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2})\b/);
+  return m ? m[1].trim() : '';
+}
+function extraerMethod(linea) {
+  const m = linea.match(/Method\s*:\s*([^\s,;]+)/i);
+  return m ? m[1].trim().toUpperCase() : '';
+}
+function parsearCSV(texto, nombreArchivo) {
+  const todasLasLineas = texto.replace(/\r/g,'').split('\n');
+  const lineas = todasLasLineas.map(l => l.trimEnd());
+
+  if (lineas.length < 2) throw new Error('Archivo incompleto: ' + nombreArchivo);
+
+  const primeraNoVacia = lineas.find(l => l.trim() !== '');
+  if (!primeraNoVacia) throw new Error('Archivo vacío: ' + nombreArchivo);
+
+  const fecha = extraerFechaHora(primeraNoVacia.trim());
+  const method = extraerMethod(primeraNoVacia.trim());
+  if (!fecha) throw new Error('No se pudo extraer fecha/hora');
+  if (!method) throw new Error('No se pudo extraer Method');
+
+  const lineaSample = lineas.find(l => /Sample Identity\s*:/i.test(l));
+  if (!lineaSample) throw new Error('No se encontró Sample Identity');
+  const m = lineaSample.match(/Sample Identity\s*:\s*(.*)$/i);
+  const sample = m ? m[1].trim() : '';
+  if (!sample) throw new Error('No se pudo extraer Sample Identity');
+
+  const lineaValores = lineas.find(l => /^\s*MED\b/i.test(l));
+  if (!lineaValores) throw new Error('No se encontró la línea de valores MED');
+
+  const valores = lineaValores.replace(/^\s*MED\s+/i,'').trim().split(/\s+/);
+  if (valores.length < 8) throw new Error('No hay suficientes valores');
+
+  return {
+    Fecha: fecha,
+    'Sample Identity': sample,
+    '% SiO2': valores[0] || '',
+    '% Al2O3': valores[1] || '',
+    '% Fe2O3': valores[2] || '',
+    '% CaO': valores[3] || '',
+    '% Na2O': valores[4] || '',
+    '% K2O': valores[5] || '',
+    '% TiO2': valores[6] || '',
+    '% PPC': valores[7] || '',
+    Method: method,
+    __rawValues: valores
+  };
+}
+function convertirCuarzo(reg) {
+  const v = reg.__rawValues || [];
+  return {
+    Fecha: reg.Fecha || '',
+    'Sample Identity': reg['Sample Identity'] || '',
+    '% Al2O3': v[0] || '',
+    '% CaO': v[1] || '',
+    '% Fe2O3': v[2] || '',
+    '% K2O': v[3] || '',
+    '% Na2O': v[4] || '',
+    '% SiO2': v[5] || '',
+    '% TiO2': v[6] || '',
+    '% PPC': v[7] || '',
+    Method: reg.Method || ''
+  };
+}
+async function leerWorkbookExistente(directorioHandle, nombreArchivo) {
+  try {
+    const fh = await directorioHandle.getFileHandle(nombreArchivo);
+    const file = await fh.getFile();
+    const buffer = await file.arrayBuffer();
+    return XLSX.read(buffer, {type:'array'});
+  } catch(e) {
+    return null;
+  }
+}
+function normalizarCabeceras(hoja, columnas) {
+  const datos = XLSX.utils.sheet_to_json(hoja, {header:1, defval:''});
+  if (!datos.length) return [columnas];
+  const resto = datos.slice(1).filter(f => f.some(v => String(v).trim() !== ''));
+  return [columnas, ...resto];
+}
+async function guardarWorkbook(directorioHandle, nombreArchivo, workbook) {
+  const wbout = XLSX.write(workbook, {bookType:'xlsx', type:'array'});
+  const fh = await directorioHandle.getFileHandle(nombreArchivo, {create:true});
+  const w = await fh.createWritable();
+  await w.write(wbout);
+  await w.close();
+}
+async function actualizarExcel(directorioHandle, nombreArchivo, columnas, registros) {
+  let wb = await leerWorkbookExistente(directorioHandle, nombreArchivo);
+  let datos;
+  if (wb && wb.SheetNames.length > 0) {
+    datos = normalizarCabeceras(wb.Sheets[wb.SheetNames[0]], columnas);
+  } else {
+    wb = XLSX.utils.book_new();
+    datos = [columnas];
+  }
+  for (const r of registros) datos.push(columnas.map(c => r[c] ?? ''));
+  const hoja = XLSX.utils.aoa_to_sheet(datos);
+  wb.SheetNames = ['Analisis'];
+  wb.Sheets = { 'Analisis': hoja };
+  await guardarWorkbook(directorioHandle, nombreArchivo, wb);
+}
+async function moverArchivo(origenHandle, nombreArchivo, destinoHandle) {
+  const ofh = await origenHandle.getFileHandle(nombreArchivo);
+  const file = await ofh.getFile();
+  const contenido = await file.arrayBuffer();
+  const dfh = await destinoHandle.getFileHandle(nombreArchivo, {create:true});
+  const w = await dfh.createWritable();
+  await w.write(contenido);
+  await w.close();
+  await origenHandle.removeEntry(nombreArchivo);
+}
+
+document.getElementById('btnOrigen').addEventListener('click', async () => {
+  try {
+    carpetaOrigenHandle = await window.showDirectoryPicker({mode:'readwrite'});
+    rutaOrigen.textContent = carpetaOrigenHandle.name;
+    ponerEstado('Carpeta CSV seleccionada.', 'ok');
+  } catch(e) {}
+});
+document.getElementById('btnDestino').addEventListener('click', async () => {
+  try {
+    carpetaDestinoHandle = await window.showDirectoryPicker({mode:'readwrite'});
+    rutaDestino.textContent = carpetaDestinoHandle.name;
+    ponerEstado('Carpeta Excel seleccionada.', 'ok');
+  } catch(e) {}
+});
+document.getElementById('btnNoValidos').addEventListener('click', async () => {
+  try {
+    carpetaNoValidosHandle = await window.showDirectoryPicker({mode:'readwrite'});
+    rutaNoValidos.textContent = carpetaNoValidosHandle.name;
+    ponerEstado('Carpeta no válidos seleccionada.', 'ok');
+  } catch(e) {}
+});
+
+async function procesarArchivos(manual = true) {
+  if (procesandoAhora) return;
+  procesandoAhora = true;
+
+  try {
+    if (!window.showDirectoryPicker) {
+      ponerEstado('Abre este archivo en Chrome o Edge.', 'err');
+      return;
+    }
+    if (!carpetaOrigenHandle || !carpetaDestinoHandle || !carpetaNoValidosHandle) {
+      if (manual) ponerEstado('Debes seleccionar las 3 carpetas.', 'warn');
+      return;
+    }
+
+    const p1 = await asegurarPermisoDirectorio(carpetaOrigenHandle);
+    const p2 = await asegurarPermisoDirectorio(carpetaDestinoHandle);
+    const p3 = await asegurarPermisoDirectorio(carpetaNoValidosHandle);
+    if (!p1 || !p2 || !p3) {
+      ponerEstado('Faltan permisos de lectura/escritura en alguna carpeta.', 'err');
+      return;
+    }
+
+    const registrosFV = [];
+    const registrosCuarzo = [];
+    const nombresFV = [];
+    const nombresCuarzo = [];
+    const noValidos = [];
+    const movidos = [];
+    const errores = [];
+    const borrados = [];
+    let totalCsv = 0;
+
+    for await (const [nombre, handle] of carpetaOrigenHandle.entries()) {
+      if (handle.kind !== 'file') continue;
+      if (!/^RESULTADOS_.*\.csv$/i.test(nombre)) continue;
+      totalCsv += 1;
+
+      try {
+        const file = await handle.getFile();
+        const texto = await file.text();
+        const reg = parsearCSV(texto, nombre);
+
+        if (reg.Method === 'FV0162') {
+          registrosFV.push(reg);
+          nombresFV.push(nombre);
+        } else if (reg.Method === 'CUARZO') {
+          registrosCuarzo.push(convertirCuarzo(reg));
+          nombresCuarzo.push(nombre);
+        } else {
+          noValidos.push({nombre, detalle: nombre + ' (Method: ' + reg.Method + ')'});
+        }
+      } catch(e) {
+        noValidos.push({nombre, detalle: nombre + ' (error de lectura o formato: ' + e.message + ')'});
+      }
+    }
+
+    if (!manual && totalCsv === 0) {
+      return;
+    }
+
+    if (registrosFV.length) {
+      await actualizarExcel(carpetaDestinoHandle, 'analisis.xlsx', columnasFV, registrosFV);
+    }
+    if (registrosCuarzo.length) {
+      await actualizarExcel(carpetaDestinoHandle, 'Analisis_cuarzo.xlsx', columnasCuarzo, registrosCuarzo);
+    }
+
+    for (const n of nombresFV) {
+      try { await carpetaOrigenHandle.removeEntry(n); borrados.push(n); }
+      catch(e) { errores.push(n + ': no se pudo borrar tras copiar'); }
+    }
+    for (const n of nombresCuarzo) {
+      try { await carpetaOrigenHandle.removeEntry(n); borrados.push(n); }
+      catch(e) { errores.push(n + ': no se pudo borrar tras copiar'); }
+    }
+
+    for (const item of noValidos) {
+      try {
+        await moverArchivo(carpetaOrigenHandle, item.nombre, carpetaNoValidosHandle);
+        movidos.push(item.detalle);
+      } catch(e) {
+        errores.push(item.nombre + ': no se pudo mover a no válidos (' + e.message + ')');
+      }
+    }
+
+    renderTabla(tablaFV, registrosFV, columnasFV);
+    renderTabla(tablaCuarzo, registrosCuarzo, columnasCuarzo);
+
+    let mensaje = '';
+    mensaje += 'Registros copiados a analisis.xlsx (FV0162): ' + registrosFV.length + '\n';
+    mensaje += 'Registros copiados a Analisis_cuarzo.xlsx (CUARZO): ' + registrosCuarzo.length + '\n';
+    mensaje += 'CSV válidos borrados tras copiar: ' + borrados.length + '\n';
+    mensaje += 'CSV movidos a la carpeta de no válidos: ' + movidos.length + '\n';
+    mensaje += 'Errores: ' + errores.length;
+
+    if (movidos.length) mensaje += '\n\nArchivos movidos:\n- ' + movidos.join('\n- ');
+    if (errores.length) mensaje += '\n\nErrores:\n- ' + errores.join('\n- ');
+
+    if (manual || totalCsv > 0) {
+      ponerEstado(mensaje, errores.length ? 'warn' : 'ok');
+    }
+  } catch(e) {
+    ponerEstado('Error general: ' + e.message, 'err');
+  } finally {
+    procesandoAhora = false;
+  }
+}
+
+async function revisarAutomaticamente() {
+  if (!autoMonitorActivo) return;
+  await procesarArchivos(false);
+}
+
+function actualizarEstadoAuto() {
+  estadoAuto.textContent = autoMonitorActivo
+    ? 'Vigilancia activada (revisión cada 1 minuto)'
+    : 'Vigilancia desactivada';
+  btnAuto.textContent = autoMonitorActivo
+    ? 'Desactivar vigilancia automática'
+    : 'Activar vigilancia automática';
+}
+
+document.getElementById('btnProcesar').addEventListener('click', async () => {
+  await procesarArchivos(true);
+});
+
+btnAuto.addEventListener('click', async () => {
+  if (autoMonitorActivo) {
+    autoMonitorActivo = false;
+    if (autoMonitorTimer) {
+      clearInterval(autoMonitorTimer);
+      autoMonitorTimer = null;
+    }
+    actualizarEstadoAuto();
+    ponerEstado('Vigilancia automática desactivada.', 'ok');
+    return;
+  }
+
+  if (!carpetaOrigenHandle || !carpetaDestinoHandle || !carpetaNoValidosHandle) {
+    ponerEstado('Debes seleccionar primero las 3 carpetas.', 'warn');
+    return;
+  }
+
+  const p1 = await asegurarPermisoDirectorio(carpetaOrigenHandle);
+  const p2 = await asegurarPermisoDirectorio(carpetaDestinoHandle);
+  const p3 = await asegurarPermisoDirectorio(carpetaNoValidosHandle);
+
+  if (!p1 || !p2 || !p3) {
+    ponerEstado('Faltan permisos de lectura/escritura en alguna carpeta.', 'err');
+    return;
+  }
+
+  autoMonitorActivo = true;
+  actualizarEstadoAuto();
+  ponerEstado('Vigilancia automática activada. Si aparece un RESULTADOS_*.csv, se procesará automáticamente.', 'ok');
+
+  await revisarAutomaticamente();
+  autoMonitorTimer = setInterval(revisarAutomaticamente, 60000);
+});
+
+actualizarEstadoAuto();
+renderTabla(tablaFV, [], columnasFV);
+renderTabla(tablaCuarzo, [], columnasCuarzo);
+</script>
+</body>
+</html>
